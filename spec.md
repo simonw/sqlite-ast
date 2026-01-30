@@ -1,4 +1,4 @@
-# python-sqlite-ast: Implementation Specification
+# sqlite-ast: Implementation Specification
 
 ## Goal
 

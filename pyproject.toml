@@ -1,5 +1,5 @@
 [project]
-name = "python-sqlite-ast"
+name = "sqlite-ast"
 version = "0.1"
 description = "Python library for parsing SQLite SELECT queries into an AST"
 readme = "README.md"
@@ -23,8 +23,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project.urls]
-Homepage = "https://github.com/simonw/python-sqlite-ast"
-Changelog = "https://github.com/simonw/python-sqlite-ast/releases"
-Issues = "https://github.com/simonw/python-sqlite-ast/issues"
-CI = "https://github.com/simonw/python-sqlite-ast/actions"
-
+Homepage = "https://github.com/simonw/sqlite-ast"
+Changelog = "https://github.com/simonw/sqlite-ast/releases"
+Issues = "https://github.com/simonw/sqlite-ast/issues"
+CI = "https://github.com/simonw/sqlite-ast/actions"

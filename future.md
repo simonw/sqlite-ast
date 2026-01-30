@@ -105,7 +105,7 @@ The current 90 tests cover the major features but there are areas worth expandin
 ### Visitor pattern
 Add a visitor/transformer API for walking and modifying AST nodes:
 ```python
-from python_sqlite_ast import parse_ast, Visitor
+from sqlite_ast import parse_ast, Visitor
 
 class ColumnCollector(Visitor):
     def __init__(self):
@@ -123,7 +123,7 @@ collector.visit(ast)
 ### AST-to-SQL serializer
 Round-trip capability: convert AST back to SQL string.
 ```python
-from python_sqlite_ast import parse_ast, to_sql
+from sqlite_ast import parse_ast, to_sql
 
 ast = parse_ast("SELECT * FROM foo WHERE x > 5")
 sql = to_sql(ast)
