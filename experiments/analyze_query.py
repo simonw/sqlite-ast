@@ -53,190 +53,7 @@ class QueryInfo:
 
 
 # ---------------------------------------------------------------------------
-# AST walking helpers
-# ---------------------------------------------------------------------------
-
-
-def _collect_tables_from_from(from_clause: list | None) -> list[str]:
-    """Walk the FROM clause and return all table names (not subquery aliases)."""
-    tables = []
-    if from_clause is None:
-        return tables
-    for item in from_clause:
-        if isinstance(item, a.TableRef):
-            tables.append(item.name)
-        elif isinstance(item, a.SubqueryRef):
-            # recurse into subquery – those tables are *used* by the query
-            tables.extend(_collect_tables_from_select(item.select))
-    return tables
-
-
-def _collect_tables_from_select(node) -> list[str]:
-    """Recursively collect all table names from a Select or Compound."""
-    tables = []
-    if isinstance(node, a.Select):
-        # CTEs
-        if node.with_ctes:
-            for cte in node.with_ctes:
-                tables.extend(_collect_tables_from_select(cte.select))
-        # FROM
-        tables.extend(_collect_tables_from_from(node.from_clause))
-        # Subqueries can also appear in expressions (WHERE, SELECT list, etc.)
-        tables.extend(_collect_tables_from_expr_list(
-            [col.expr for col in node.columns]
-        ))
-        if node.where:
-            tables.extend(_collect_tables_from_expr(node.where))
-        if node.having:
-            tables.extend(_collect_tables_from_expr(node.having))
-    elif isinstance(node, a.Compound):
-        for part in node.body:
-            tables.extend(_collect_tables_from_select(part.select))
-    return tables
-
-
-def _collect_tables_from_expr(expr) -> list[str]:
-    """Find table references inside scalar subqueries / EXISTS / IN-subquery."""
-    tables = []
-    if expr is None:
-        return tables
-    if isinstance(expr, a.Subquery):
-        tables.extend(_collect_tables_from_select(expr.select))
-    elif isinstance(expr, a.Exists):
-        tables.extend(_collect_tables_from_select(expr.select))
-    elif isinstance(expr, a.InList):
-        tables.extend(_collect_tables_from_expr(expr.expr))
-        if expr.select:
-            tables.extend(_collect_tables_from_select(expr.select))
-        if expr.values:
-            tables.extend(_collect_tables_from_expr_list(expr.values))
-    elif isinstance(expr, a.FunctionCall):
-        tables.extend(_collect_tables_from_expr_list(expr.args))
-    elif isinstance(expr, a.BinaryOp):
-        tables.extend(_collect_tables_from_expr(expr.left))
-        tables.extend(_collect_tables_from_expr(expr.right))
-    elif isinstance(expr, a.UnaryOp):
-        tables.extend(_collect_tables_from_expr(expr.operand))
-    elif isinstance(expr, a.Case):
-        if expr.operand:
-            tables.extend(_collect_tables_from_expr(expr.operand))
-        for w, t in expr.when_clauses:
-            tables.extend(_collect_tables_from_expr(w))
-            tables.extend(_collect_tables_from_expr(t))
-        if expr.else_expr:
-            tables.extend(_collect_tables_from_expr(expr.else_expr))
-    elif isinstance(expr, a.Cast):
-        tables.extend(_collect_tables_from_expr(expr.expr))
-    elif isinstance(expr, a.Between):
-        tables.extend(_collect_tables_from_expr(expr.expr))
-        tables.extend(_collect_tables_from_expr(expr.low))
-        tables.extend(_collect_tables_from_expr(expr.high))
-    elif isinstance(expr, a.Collate):
-        tables.extend(_collect_tables_from_expr(expr.expr))
-    elif isinstance(expr, a.IsNull):
-        tables.extend(_collect_tables_from_expr(expr.operand))
-    elif isinstance(expr, a.NotNull):
-        tables.extend(_collect_tables_from_expr(expr.operand))
-    # Dot, Name, literals – no sub-tables
-    return tables
-
-
-def _collect_tables_from_expr_list(exprs: list) -> list[str]:
-    tables = []
-    for e in exprs:
-        tables.extend(_collect_tables_from_expr(e))
-    return tables
-
-
-# ---------------------------------------------------------------------------
-# Infer output columns from a Select / Compound AST node
-# ---------------------------------------------------------------------------
-
-
-def _infer_output_columns(
-    node,
-    columns_for_table: Callable[[str], list[str]] | None,
-) -> list[str]:
-    """
-    Given a Select or Compound node, return the list of output column names
-    that this query produces.
-
-    Rules (matching SQLite behavior):
-      - ResultColumn with alias → alias
-      - ResultColumn with Name("col") → "col"
-      - ResultColumn with Dot(Name("t"), Name("col")) → "col"
-      - ResultColumn with Star() → expand all FROM tables
-      - ResultColumn with Dot(Name("t"), Star()) → expand that table
-      - ResultColumn with expression (no alias) → expression summary as name
-      - Compound → use first SELECT's columns
-    """
-    if isinstance(node, a.Compound):
-        return _infer_output_columns(node.body[0].select, columns_for_table)
-
-    if not isinstance(node, a.Select):
-        return []
-
-    # We need the FROM alias map to expand stars and resolve bare table refs
-    alias_map = _build_alias_map(node.from_clause, columns_for_table)
-
-    result = []
-    for col in node.columns:
-        if col.alias:
-            result.append(col.alias)
-        elif isinstance(col.expr, a.Name):
-            result.append(col.expr.name)
-        elif isinstance(col.expr, a.Dot):
-            if isinstance(col.expr.right, a.Name):
-                result.append(col.expr.right.name)
-            elif isinstance(col.expr.right, a.Star):
-                # table.* → expand
-                if isinstance(col.expr.left, a.Name):
-                    table_name = alias_map.get(col.expr.left.name, col.expr.left.name)
-                    if columns_for_table:
-                        result.extend(columns_for_table(table_name))
-                    else:
-                        result.append("*")
-            else:
-                result.append(_expr_summary(col.expr))
-        elif isinstance(col.expr, a.Star):
-            # SELECT * → expand all tables
-            if columns_for_table:
-                for real_table in dict.fromkeys(alias_map.values()):
-                    result.extend(columns_for_table(real_table))
-            else:
-                result.append("*")
-        else:
-            result.append(_expr_summary(col.expr))
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Build alias→real-table mapping from FROM clause
-# ---------------------------------------------------------------------------
-
-
-def _build_alias_map(
-    from_clause: list | None,
-    columns_for_table: Callable[[str], list[str]] | None = None,
-) -> dict[str, str]:
-    """Return {alias_or_name: table_name} for every table/subquery in FROM."""
-    mapping: dict[str, str] = {}
-    if from_clause is None:
-        return mapping
-    for item in from_clause:
-        if isinstance(item, a.TableRef):
-            key = item.alias if item.alias else item.name
-            mapping[key] = item.name
-        elif isinstance(item, a.SubqueryRef):
-            # Include subquery aliases: alias maps to itself (it's a virtual
-            # "table" whose columns we infer separately).
-            if item.alias:
-                mapping[item.alias] = item.alias
-    return mapping
-
-
-# ---------------------------------------------------------------------------
-# Resolve a column expression to "table.column" where possible
+# Column resolution helpers (need alias map + schema callback — not on nodes)
 # ---------------------------------------------------------------------------
 
 
@@ -263,7 +80,6 @@ def _resolve_column_ref(
             if isinstance(right, a.Name):
                 return [f"{table_name}.{right.name}"]
             elif isinstance(right, a.Star):
-                # table.*  → expand
                 if columns_for_table:
                     cols = columns_for_table(table_name)
                     return [f"{table_name}.{c}" for c in cols]
@@ -271,7 +87,6 @@ def _resolve_column_ref(
                     return [f"{table_name}.*"]
     elif isinstance(expr, a.Name):
         col_name = expr.name
-        # Try to find which table owns this column
         if columns_for_table:
             owners = []
             for real_table in set(alias_map.values()):
@@ -279,10 +94,8 @@ def _resolve_column_ref(
                     owners.append(real_table)
             if len(owners) == 1:
                 return [f"{owners[0]}.{col_name}"]
-        # If ambiguous or no callback, just return the bare name
         return [col_name]
     elif isinstance(expr, a.Star):
-        # SELECT *  → expand all tables
         if columns_for_table:
             result = []
             for real_table in dict.fromkeys(alias_map.values()):
@@ -294,138 +107,39 @@ def _resolve_column_ref(
     return []
 
 
-# ---------------------------------------------------------------------------
-# Collect functions from an expression tree
-# ---------------------------------------------------------------------------
-
-
-def _collect_functions(expr) -> list[str]:
-    """Walk an expression and return all function names used."""
-    funcs = []
-    if expr is None:
-        return funcs
+def _expr_summary(expr) -> str:
+    """Short human-readable summary of an expression (for non-column expressions)."""
     if isinstance(expr, a.FunctionCall):
-        funcs.append(expr.name)
-        for arg in expr.args:
-            funcs.extend(_collect_functions(arg))
-        if expr.over:
-            _collect_functions_from_window(expr.over, funcs)
-    elif isinstance(expr, a.BinaryOp):
-        funcs.extend(_collect_functions(expr.left))
-        funcs.extend(_collect_functions(expr.right))
-    elif isinstance(expr, a.UnaryOp):
-        funcs.extend(_collect_functions(expr.operand))
+        args = ", ".join(_expr_summary(a_) for a_ in expr.args)
+        return f"{expr.name}({args})"
+    elif isinstance(expr, a.Name):
+        return expr.name
     elif isinstance(expr, a.Dot):
-        funcs.extend(_collect_functions(expr.left))
-        funcs.extend(_collect_functions(expr.right))
-    elif isinstance(expr, a.Case):
-        if expr.operand:
-            funcs.extend(_collect_functions(expr.operand))
-        for w, t in expr.when_clauses:
-            funcs.extend(_collect_functions(w))
-            funcs.extend(_collect_functions(t))
-        if expr.else_expr:
-            funcs.extend(_collect_functions(expr.else_expr))
+        return f"{_expr_summary(expr.left)}.{_expr_summary(expr.right)}"
+    elif isinstance(expr, a.Star):
+        return "*"
+    elif isinstance(expr, a.IntegerLiteral):
+        return str(expr.value)
+    elif isinstance(expr, a.StringLiteral):
+        return repr(expr.value)
+    elif isinstance(expr, a.BinaryOp):
+        return f"({_expr_summary(expr.left)} {expr.op} {_expr_summary(expr.right)})"
+    elif isinstance(expr, a.UnaryOp):
+        return f"({expr.op} {_expr_summary(expr.operand)})"
     elif isinstance(expr, a.Cast):
-        funcs.extend(_collect_functions(expr.expr))
-    elif isinstance(expr, a.Between):
-        funcs.extend(_collect_functions(expr.expr))
-        funcs.extend(_collect_functions(expr.low))
-        funcs.extend(_collect_functions(expr.high))
-    elif isinstance(expr, a.InList):
-        funcs.extend(_collect_functions(expr.expr))
-        if expr.values:
-            for v in expr.values:
-                funcs.extend(_collect_functions(v))
+        return f"CAST({_expr_summary(expr.expr)} AS {expr.as_type})"
+    elif isinstance(expr, a.Case):
+        return "CASE..."
     elif isinstance(expr, a.Subquery):
-        funcs.extend(_collect_functions_from_select(expr.select))
-    elif isinstance(expr, a.Exists):
-        funcs.extend(_collect_functions_from_select(expr.select))
+        return "(subquery)"
+    elif isinstance(expr, a.NullLiteral):
+        return "NULL"
+    elif isinstance(expr, a.FloatLiteral):
+        return expr.value
     elif isinstance(expr, a.Collate):
-        funcs.extend(_collect_functions(expr.expr))
-    elif isinstance(expr, a.IsNull):
-        funcs.extend(_collect_functions(expr.operand))
-    elif isinstance(expr, a.NotNull):
-        funcs.extend(_collect_functions(expr.operand))
-    return funcs
-
-
-def _collect_functions_from_window(win: a.WindowSpec, out: list[str]):
-    if win.filter:
-        out.extend(_collect_functions(win.filter))
-    if win.partition_by:
-        for e in win.partition_by:
-            out.extend(_collect_functions(e))
-    if win.order_by:
-        for item in win.order_by:
-            out.extend(_collect_functions(item.expr))
-
-
-def _collect_functions_from_select(node) -> list[str]:
-    funcs = []
-    if isinstance(node, a.Select):
-        for col in node.columns:
-            funcs.extend(_collect_functions(col.expr))
-    elif isinstance(node, a.Compound):
-        for part in node.body:
-            funcs.extend(_collect_functions_from_select(part.select))
-    return funcs
-
-
-# ---------------------------------------------------------------------------
-# Build augmented columns_for_table with CTE + subquery-in-FROM knowledge
-# ---------------------------------------------------------------------------
-
-
-def _build_augmented_columns_for_table(
-    node,
-    base_columns_for_table: Callable[[str], list[str]] | None,
-) -> Callable[[str], list[str]]:
-    """
-    Given a parsed AST and a base columns_for_table callback (which knows
-    about real database tables), return an augmented callback that also
-    knows about:
-      - CTE output columns (inferred from their SELECT lists)
-      - Subquery-in-FROM output columns (inferred from their SELECT lists)
-
-    CTEs are processed in order so that later CTEs can reference earlier ones.
-    """
-    extra_schemas: dict[str, list[str]] = {}
-
-    def augmented(table: str) -> list[str]:
-        if table in extra_schemas:
-            return extra_schemas[table]
-        if base_columns_for_table:
-            return base_columns_for_table(table)
-        return []
-
-    # Unwrap to the outer Select
-    outer = node
-    if isinstance(node, a.Compound):
-        outer = node.body[0].select
-
-    if not isinstance(outer, a.Select):
-        return augmented
-
-    # 1. Process CTEs in order
-    if outer.with_ctes:
-        for cte in outer.with_ctes:
-            if cte.columns:
-                # Explicit column list: WITH cte(a, b, c) AS (...)
-                extra_schemas[cte.name] = list(cte.columns)
-            else:
-                # Infer from the CTE's SELECT
-                inferred = _infer_output_columns(cte.select, augmented)
-                extra_schemas[cte.name] = inferred
-
-    # 2. Process subqueries in FROM
-    if outer.from_clause:
-        for item in outer.from_clause:
-            if isinstance(item, a.SubqueryRef) and item.alias:
-                inferred = _infer_output_columns(item.select, augmented)
-                extra_schemas[item.alias] = inferred
-
-    return augmented
+        return f"{_expr_summary(expr.expr)} COLLATE {expr.collation}"
+    else:
+        return f"<{type(expr).__name__}>"
 
 
 # ---------------------------------------------------------------------------
@@ -452,18 +166,17 @@ def analyze_query(
     # --- unwrap: work with the "outer" select ---
     outer = node
     if isinstance(node, a.Compound):
-        # For compound queries, analyse the first SELECT for column info
         outer = node.body[0].select
 
     # Build augmented column lookup that knows CTE + subquery schemas
-    aug_columns = _build_augmented_columns_for_table(node, columns_for_table)
+    aug_columns = outer._augmented_columns_for_table(columns_for_table)
 
-    # 1. Tables
-    raw_tables = _collect_tables_from_select(node)
+    # 1. Tables — use the node method
+    raw_tables = node.tables_referenced()
     info.tables = list(dict.fromkeys(raw_tables))  # dedupe, preserve order
 
     # 2. Alias map (from outermost FROM)
-    alias_map = _build_alias_map(outer.from_clause, aug_columns)
+    alias_map = outer._alias_map()
 
     # 3. Select columns (resolve stars, qualified refs, bare names)
     for col in outer.columns:
@@ -471,7 +184,6 @@ def analyze_query(
         if resolved:
             info.select_columns.extend(resolved)
         else:
-            # It's an expression (function call, literal, etc.) – describe it
             if col.alias:
                 info.select_columns.append(col.alias)
             else:
@@ -487,7 +199,6 @@ def analyze_query(
                 for r in resolved:
                     info.order_by_columns.append(f"{r} {direction}")
             elif isinstance(item.expr, a.IntegerLiteral):
-                # ORDER BY 1 – positional
                 idx = item.expr.value - 1
                 if 0 <= idx < len(info.select_columns):
                     info.order_by_columns.append(
@@ -502,10 +213,8 @@ def analyze_query(
                     f"<expr: {_expr_summary(item.expr)}> {item.direction}"
                 )
 
-    # 5. Functions in SELECT
-    for col in outer.columns:
-        info.select_functions.extend(_collect_functions(col.expr))
-    info.select_functions = list(dict.fromkeys(info.select_functions))
+    # 5. Functions in SELECT — use the node method
+    info.select_functions = list(dict.fromkeys(node.functions_used()))
 
     # 6. Extras
     info.extras["has_where"] = outer.where is not None
@@ -547,46 +256,11 @@ def analyze_query(
             ]
     # Subqueries in WHERE
     if outer.where:
-        sub_tables = _collect_tables_from_expr(outer.where)
+        sub_tables = outer.where.tables_referenced()
         if sub_tables:
             info.extras["where_references_tables"] = list(dict.fromkeys(sub_tables))
 
     return info
-
-
-def _expr_summary(expr) -> str:
-    """Short human-readable summary of an expression (for non-column expressions)."""
-    if isinstance(expr, a.FunctionCall):
-        args = ", ".join(_expr_summary(a_) for a_ in expr.args)
-        return f"{expr.name}({args})"
-    elif isinstance(expr, a.Name):
-        return expr.name
-    elif isinstance(expr, a.Dot):
-        return f"{_expr_summary(expr.left)}.{_expr_summary(expr.right)}"
-    elif isinstance(expr, a.Star):
-        return "*"
-    elif isinstance(expr, a.IntegerLiteral):
-        return str(expr.value)
-    elif isinstance(expr, a.StringLiteral):
-        return repr(expr.value)
-    elif isinstance(expr, a.BinaryOp):
-        return f"({_expr_summary(expr.left)} {expr.op} {_expr_summary(expr.right)})"
-    elif isinstance(expr, a.UnaryOp):
-        return f"({expr.op} {_expr_summary(expr.operand)})"
-    elif isinstance(expr, a.Cast):
-        return f"CAST({_expr_summary(expr.expr)} AS {expr.as_type})"
-    elif isinstance(expr, a.Case):
-        return "CASE..."
-    elif isinstance(expr, a.Subquery):
-        return "(subquery)"
-    elif isinstance(expr, a.NullLiteral):
-        return "NULL"
-    elif isinstance(expr, a.FloatLiteral):
-        return expr.value
-    elif isinstance(expr, a.Collate):
-        return f"{_expr_summary(expr.expr)} COLLATE {expr.collation}"
-    else:
-        return f"<{type(expr).__name__}>"
 
 
 # ---------------------------------------------------------------------------
@@ -1152,21 +826,14 @@ WHAT WORKS RELIABLY
    - Explicit CTE column lists (Test 30):
      `WITH summary(uid, spend) AS (...)` → uses the explicit names.
    - CTE using SELECT * from a real table (Test 31):
-     `WITH all_users AS (SELECT * FROM users)` → inherits users' columns.
+     `With all_users AS (SELECT * FROM users)` → inherits users' columns.
    - Combined CTE + subquery-in-FROM (Test 33) works.
 
-   Implementation: _infer_output_columns() walks a Select's ResultColumn
-   list applying these rules:
-     - alias present → use alias
-     - Name("col") → use "col"
-     - Dot(Name("t"), Name("col")) → use "col"
-     - Star() → expand all FROM tables
-     - Dot(Name("t"), Star()) → expand that table
-     - expression without alias → use expression summary
-
-   _build_augmented_columns_for_table() wraps the base callback, processing
-   CTEs in declaration order and subqueries-in-FROM so each augments the
-   lookup before subsequent ones are resolved.
+   Now implemented as methods on the AST nodes:
+     - Select.output_columns(columns_for_table) → column names produced
+     - CTE.output_columns(columns_for_table) → explicit list or inferred
+     - SubqueryRef.output_columns(columns_for_table) → delegates to select
+     - Compound.output_columns(columns_for_table) → first SELECT's columns
 
 4. ORDER BY COLUMNS (high confidence for simple cases)
    - Qualified refs (o.total) → resolved via alias map. Works.
@@ -1186,6 +853,11 @@ WHAT WORKS RELIABLY
      So `name LIKE '%x%'` shows up as a LIKE function. This is a feature of
      the parser matching SQLite's own behavior, not a bug.
 
+   Now implemented as methods on the AST nodes:
+     - Every expression node has .functions_used() → list[str]
+     - Select.functions_used() → functions from SELECT column expressions
+     - Compound.functions_used() → functions across all branches
+
 6. HIGH-LEVEL EXTRAS (reliable)
    - has_where, has_group_by, has_having, has_limit, has_order_by, is_distinct
    - is_compound + compound_operators (UNION, UNION ALL, etc.)
@@ -1193,6 +865,12 @@ WHAT WORKS RELIABLY
    - subquery_schemas (inferred column lists per subquery-in-FROM)
    - joins with type (JOIN, LEFT JOIN, etc.) and table name
    - where_references_tables (tables found in WHERE subqueries)
+
+   Now implemented as methods on the AST nodes:
+     - Every expression node has .tables_referenced() → list[str]
+     - Select/Compound.tables_referenced() → all tables recursively
+     - TableRef.tables_referenced() → [self.name]
+     - SubqueryRef/CTE/CompoundPart.tables_referenced() → delegates to select
 
 KNOWN LIMITATIONS / EDGE CASES
 ================================
@@ -1212,7 +890,7 @@ KNOWN LIMITATIONS / EDGE CASES
 
 3. EXPRESSION COLUMNS WITHOUT ALIASES
    When a CTE or subquery SELECT list contains an expression without an alias
-   (e.g., `SELECT 1+2, COUNT(*)`), we use _expr_summary() as the column
+   (e.g., `SELECT 1+2, COUNT(*)`), we use _expr_column_name() as the column
    name. SQLite internally uses the expression text, which is close but not
    guaranteed identical. In practice, such columns almost always have aliases
    in real-world queries.
@@ -1228,18 +906,12 @@ sqlite-ast provides a reliable, complete AST that makes all of the above
 extractions straightforward. The AST structure maps directly to the query
 structure, with clean dataclass nodes that are easy to walk recursively.
 
-CTE and subquery-in-FROM column inference closes the main semantic gap
-identified in the first round of experiments. The augmented lookup approach
-(process CTEs in order, each augmenting the callback for the next) handles
-chained dependencies, explicit column lists, and star expansion through
-virtual tables cleanly.
+Analysis methods are now part of the AST node API:
+  - node.tables_referenced()       → all table names in the subtree
+  - node.functions_used()          → all function names in the subtree
+  - node.output_columns(callback)  → column names this query produces
 
-The library is well-suited for:
-- Extracting table dependencies from queries
-- Understanding query structure (joins, subqueries, CTEs, etc.)
-- Identifying functions used
-- Resolving column references when schema info is available
-- Building query analysis/linting/documentation tools
+These work on Select, Compound, CTE, SubqueryRef, and all expression nodes.
 """)
 
 
