@@ -14,7 +14,8 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest",
-    "sqlite-ast-conformance"
+    "sqlite-ast-conformance",
+    "cogapp"
 ]
 
 [build-system]

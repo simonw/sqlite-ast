@@ -24,4 +24,5 @@ jobs:
         pip install . --group dev
     - name: Run tests
       run: |
+        cog --check README.md
         if [ -d tests ]; then python -m pytest; else echo "Tests directory not found"; fi

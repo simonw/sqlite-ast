@@ -64,6 +64,8 @@ class Parser:
         self.tokens = tokens
         self.sql = sql
         self.pos = 0
+        # Best-effort partial AST: last successfully parsed SELECT node.
+        self._last_good_ast: ast.Select | ast.Compound | None = None
 
     # --- Token helpers ---
 
@@ -113,7 +115,10 @@ class Parser:
 
     def _error(self, msg: str):
         tok = self.peek()
-        raise ParseError(f"Parse error at position {tok.pos}: {msg}")
+        raise ParseError(
+            f"Parse error at position {tok.pos}: {msg}",
+            partial_ast=self._last_good_ast,
+        )
 
     # --- Top-level ---
 
@@ -229,6 +234,8 @@ class Parser:
                 if self.match(TokenType.OFFSET):
                     sel.offset = self._parse_expr()
 
+        # Record the last fully parsed SELECT as a partial AST candidate.
+        self._last_good_ast = sel
         return sel
 
     # --- Result columns ---
