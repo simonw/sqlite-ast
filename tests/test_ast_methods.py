@@ -224,6 +224,30 @@ class TestOutputColumns:
         assert cols[0] == OutputColumn(table=None, column="name")
         assert cols[1] == OutputColumn(table=None, column="email")
 
+    def test_bare_columns_resolved_with_callback(self):
+        """Bare column names resolve to their table when a callback is provided."""
+        node = parse_ast("SELECT id, name FROM users")
+        cols = node.output_columns(columns_for_table)
+        assert cols[0] == OutputColumn(table="users", column="id")
+        assert cols[1] == OutputColumn(table="users", column="name")
+
+    def test_bare_columns_ambiguous_left_unresolved(self):
+        """Bare column that exists in multiple tables stays unresolved."""
+        node = parse_ast("""
+            SELECT name FROM users u JOIN products p ON u.id = p.id
+        """)
+        cols = node.output_columns(columns_for_table)
+        assert cols[0] == OutputColumn(table=None, column="name")
+
+    def test_bare_columns_unique_across_join(self):
+        """Bare column unique to one table in a JOIN is resolved."""
+        node = parse_ast("""
+            SELECT email, total FROM users u JOIN orders o ON u.id = o.user_id
+        """)
+        cols = node.output_columns(columns_for_table)
+        assert cols[0] == OutputColumn(table="users", column="email")
+        assert cols[1] == OutputColumn(table="orders", column="total")
+
     def test_qualified_columns(self):
         node = parse_ast("SELECT u.name, u.email FROM users u")
         cols = node.output_columns()

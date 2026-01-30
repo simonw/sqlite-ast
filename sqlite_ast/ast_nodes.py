@@ -738,7 +738,13 @@ class Select:
             if col.alias:
                 result.append(OutputColumn(table=None, column=col.alias))
             elif isinstance(col.expr, Name):
-                result.append(OutputColumn(table=None, column=col.expr.name))
+                # Try to resolve bare column to its owning table
+                owners = [
+                    t for t in dict.fromkeys(alias_map.values())
+                    if col.expr.name in augmented(t)
+                ]
+                table = owners[0] if len(owners) == 1 else None
+                result.append(OutputColumn(table=table, column=col.expr.name))
             elif isinstance(col.expr, Dot):
                 if isinstance(col.expr.right, Name):
                     table = alias_map.get(
