@@ -1,2 +1,3 @@
-def example_function():
-    return 1 + 1
+from .parser import parse, ParseError
+
+__all__ = ["parse", "ParseError"]

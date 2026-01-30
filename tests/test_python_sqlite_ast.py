@@ -1,5 +1,22 @@
-from python_sqlite_ast import example_function
+import json
+import pytest
+from pathlib import Path
+
+from sqlite_ast_conformance import AST_TESTS_DIR
+from python_sqlite_ast import parse, ParseError
 
 
-def test_example_function():
-    assert example_function() == 2
+def load_conformance_tests():
+    """Load all conformance test fixtures."""
+    tests = []
+    for path in sorted(Path(AST_TESTS_DIR).glob("*.json")):
+        data = json.loads(path.read_text())
+        tests.append(pytest.param(data["sql"], data["ast"], id=path.stem))
+    return tests
+
+
+@pytest.mark.parametrize("sql,expected_ast", load_conformance_tests())
+@pytest.mark.xfail(reason="Not yet implemented", strict=False)
+def test_conformance(sql, expected_ast):
+    result = parse(sql)
+    assert result == expected_ast
