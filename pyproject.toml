@@ -1,6 +1,29 @@
 [project]
-name = "placeholder"
+name = "python-sqlite-ast"
 version = "0.1"
+description = "Python library for parsing SQLite SELECT queries into an AST"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Simon Willison"}]
+license = "Apache-2.0"
+classifiers = []
+dependencies = [
+
+]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = [
+    "pytest"
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+
+[project.urls]
+Homepage = "https://github.com/simonw/python-sqlite-ast"
+Changelog = "https://github.com/simonw/python-sqlite-ast/releases"
+Issues = "https://github.com/simonw/python-sqlite-ast/issues"
+CI = "https://github.com/simonw/python-sqlite-ast/actions"
+
