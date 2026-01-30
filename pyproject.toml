@@ -21,6 +21,9 @@ dev = [
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+packages = ["sqlite_ast"]
+
 
 [project.urls]
 Homepage = "https://github.com/simonw/sqlite-ast"
