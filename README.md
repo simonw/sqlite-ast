@@ -181,7 +181,7 @@ node = parse_ast("""
 print(node.tables_referenced())
 ```
 ```text
-['users', 'orders', 'orders']
+['users', 'orders']
 ```
 <!-- [[[end]]] -->
 

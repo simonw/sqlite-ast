@@ -651,7 +651,7 @@ class Select:
         return d
 
     def tables_referenced(self) -> list[str]:
-        """Return all table names referenced anywhere in this SELECT."""
+        """Return deduplicated table names referenced anywhere in this SELECT."""
         tables: list[str] = []
         if self.with_ctes:
             for cte in self.with_ctes:
@@ -665,14 +665,14 @@ class Select:
             tables.extend(self.where.tables_referenced())
         if self.having:
             tables.extend(self.having.tables_referenced())
-        return tables
+        return list(dict.fromkeys(tables))
 
     def functions_used(self) -> list[str]:
-        """Return all function names used in this SELECT's column expressions."""
+        """Return deduplicated function names used in this SELECT's column expressions."""
         funcs: list[str] = []
         for col in self.columns:
             funcs.extend(col.expr.functions_used())
-        return funcs
+        return list(dict.fromkeys(funcs))
 
     def _augmented_columns_for_table(
         self,
@@ -808,13 +808,13 @@ class Compound:
         tables: list[str] = []
         for part in self.body:
             tables.extend(part.tables_referenced())
-        return tables
+        return list(dict.fromkeys(tables))
 
     def functions_used(self) -> list[str]:
         funcs: list[str] = []
         for part in self.body:
             funcs.extend(part.select.functions_used())
-        return funcs
+        return list(dict.fromkeys(funcs))
 
     def output_columns(
         self,
