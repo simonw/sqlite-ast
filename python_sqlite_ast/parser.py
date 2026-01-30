@@ -151,6 +151,7 @@ class Parser:
         ):
             return first
 
+        first._compound_member = True
         parts = [ast.CompoundPart(select=first, operator=None)]
         while self.at(TokenType.UNION, TokenType.INTERSECT, TokenType.EXCEPT):
             op_tok = self.advance()
@@ -158,6 +159,7 @@ class Parser:
             if operator == "UNION" and self.match(TokenType.ALL):
                 operator = "UNION ALL"
             next_select = self._parse_simple_select()
+            next_select._compound_member = True
             parts.append(ast.CompoundPart(select=next_select, operator=operator))
 
         compound = ast.Compound(body=parts)
@@ -432,15 +434,11 @@ class Parser:
     def _parse_order_by_item(self) -> ast.OrderByItem:
         expr = self._parse_expr()
         direction = "ASC"
-        if self.match(TokenType.ASC):
-            direction = "ASC"
-        elif self.match(TokenType.DESC):
-            direction = "DESC"
-        # Peek for ASC/DESC as fallback ID tokens
-        elif self.peek().value.upper() == "ASC" and self.peek_type() != TokenType.ID:
+        # ASC/DESC are fallback keywords — check by value
+        if self.peek().value.upper() == "ASC":
             self.advance()
             direction = "ASC"
-        elif self.peek().value.upper() == "DESC" and self.peek_type() != TokenType.ID:
+        elif self.peek().value.upper() == "DESC":
             self.advance()
             direction = "DESC"
 

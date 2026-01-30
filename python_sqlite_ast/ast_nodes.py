@@ -401,6 +401,7 @@ class Select:
     limit: Any | None = None
     offset: Any | None = None
     _has_limit: bool = False  # track whether LIMIT was present at all
+    _compound_member: bool = False  # True when inside a compound select body
 
     def to_dict(self) -> dict:
         d: dict = {"type": "select", "distinct": self.distinct, "all": self.all}
@@ -421,14 +422,15 @@ class Select:
         d["having"] = self.having.to_dict() if self.having else None
         if self.window_definitions is not None:
             d["window_definitions"] = [w.to_dict() for w in self.window_definitions]
-        d["order_by"] = (
-            [o.to_dict() for o in self.order_by]
-            if self.order_by is not None
-            else None
-        )
-        d["limit"] = self.limit.to_dict() if self.limit else None
-        if self._has_limit:
-            d["offset"] = self.offset.to_dict() if self.offset else None
+        if not self._compound_member:
+            d["order_by"] = (
+                [o.to_dict() for o in self.order_by]
+                if self.order_by is not None
+                else None
+            )
+            d["limit"] = self.limit.to_dict() if self.limit else None
+            if self._has_limit:
+                d["offset"] = self.offset.to_dict() if self.offset else None
         return d
 
 
