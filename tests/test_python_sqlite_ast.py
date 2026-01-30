@@ -3,7 +3,7 @@ import pytest
 from pathlib import Path
 
 from sqlite_ast_conformance import AST_TESTS_DIR
-from python_sqlite_ast import parse, ParseError
+from sqlite_ast import parse, ParseError
 
 
 def load_conformance_tests():
