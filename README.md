@@ -228,7 +228,31 @@ orders.total orders total
 ```
 <!-- [[[end]]] -->
 
-Pass a `columns_for_table` callback to resolve `SELECT *` and `SELECT t.*`:
+Pass a `columns_for_table` callback to resolve `SELECT *`, `SELECT t.*`, and bare column names to their owning table:
+
+<!-- [[[cog
+render_example("examples/output_columns_bare.py", "text")
+]]] -->
+```python
+from sqlite_ast import parse_ast
+
+SCHEMA = {
+    "users": ["id", "name", "email"],
+    "orders": ["id", "user_id", "total"],
+}
+
+node = parse_ast("SELECT id, name, email FROM users")
+for col in node.output_columns(lambda table: SCHEMA.get(table, [])):
+    print(col)
+```
+```text
+users.id
+users.name
+users.email
+```
+<!-- [[[end]]] -->
+
+The same callback resolves `SELECT *` expansion:
 
 <!-- [[[cog
 render_example("examples/output_columns_star.py", "text")
