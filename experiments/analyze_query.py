@@ -149,12 +149,77 @@ def _collect_tables_from_expr_list(exprs: list) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Infer output columns from a Select / Compound AST node
+# ---------------------------------------------------------------------------
+
+
+def _infer_output_columns(
+    node,
+    columns_for_table: Callable[[str], list[str]] | None,
+) -> list[str]:
+    """
+    Given a Select or Compound node, return the list of output column names
+    that this query produces.
+
+    Rules (matching SQLite behavior):
+      - ResultColumn with alias → alias
+      - ResultColumn with Name("col") → "col"
+      - ResultColumn with Dot(Name("t"), Name("col")) → "col"
+      - ResultColumn with Star() → expand all FROM tables
+      - ResultColumn with Dot(Name("t"), Star()) → expand that table
+      - ResultColumn with expression (no alias) → expression summary as name
+      - Compound → use first SELECT's columns
+    """
+    if isinstance(node, a.Compound):
+        return _infer_output_columns(node.body[0].select, columns_for_table)
+
+    if not isinstance(node, a.Select):
+        return []
+
+    # We need the FROM alias map to expand stars and resolve bare table refs
+    alias_map = _build_alias_map(node.from_clause, columns_for_table)
+
+    result = []
+    for col in node.columns:
+        if col.alias:
+            result.append(col.alias)
+        elif isinstance(col.expr, a.Name):
+            result.append(col.expr.name)
+        elif isinstance(col.expr, a.Dot):
+            if isinstance(col.expr.right, a.Name):
+                result.append(col.expr.right.name)
+            elif isinstance(col.expr.right, a.Star):
+                # table.* → expand
+                if isinstance(col.expr.left, a.Name):
+                    table_name = alias_map.get(col.expr.left.name, col.expr.left.name)
+                    if columns_for_table:
+                        result.extend(columns_for_table(table_name))
+                    else:
+                        result.append("*")
+            else:
+                result.append(_expr_summary(col.expr))
+        elif isinstance(col.expr, a.Star):
+            # SELECT * → expand all tables
+            if columns_for_table:
+                for real_table in dict.fromkeys(alias_map.values()):
+                    result.extend(columns_for_table(real_table))
+            else:
+                result.append("*")
+        else:
+            result.append(_expr_summary(col.expr))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Build alias→real-table mapping from FROM clause
 # ---------------------------------------------------------------------------
 
 
-def _build_alias_map(from_clause: list | None) -> dict[str, str]:
-    """Return {alias_or_name: table_name} for every table in FROM."""
+def _build_alias_map(
+    from_clause: list | None,
+    columns_for_table: Callable[[str], list[str]] | None = None,
+) -> dict[str, str]:
+    """Return {alias_or_name: table_name} for every table/subquery in FROM."""
     mapping: dict[str, str] = {}
     if from_clause is None:
         return mapping
@@ -163,8 +228,10 @@ def _build_alias_map(from_clause: list | None) -> dict[str, str]:
             key = item.alias if item.alias else item.name
             mapping[key] = item.name
         elif isinstance(item, a.SubqueryRef):
-            # subquery alias doesn't map to a real table
-            pass
+            # Include subquery aliases: alias maps to itself (it's a virtual
+            # "table" whose columns we infer separately).
+            if item.alias:
+                mapping[item.alias] = item.alias
     return mapping
 
 
@@ -306,6 +373,62 @@ def _collect_functions_from_select(node) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Build augmented columns_for_table with CTE + subquery-in-FROM knowledge
+# ---------------------------------------------------------------------------
+
+
+def _build_augmented_columns_for_table(
+    node,
+    base_columns_for_table: Callable[[str], list[str]] | None,
+) -> Callable[[str], list[str]]:
+    """
+    Given a parsed AST and a base columns_for_table callback (which knows
+    about real database tables), return an augmented callback that also
+    knows about:
+      - CTE output columns (inferred from their SELECT lists)
+      - Subquery-in-FROM output columns (inferred from their SELECT lists)
+
+    CTEs are processed in order so that later CTEs can reference earlier ones.
+    """
+    extra_schemas: dict[str, list[str]] = {}
+
+    def augmented(table: str) -> list[str]:
+        if table in extra_schemas:
+            return extra_schemas[table]
+        if base_columns_for_table:
+            return base_columns_for_table(table)
+        return []
+
+    # Unwrap to the outer Select
+    outer = node
+    if isinstance(node, a.Compound):
+        outer = node.body[0].select
+
+    if not isinstance(outer, a.Select):
+        return augmented
+
+    # 1. Process CTEs in order
+    if outer.with_ctes:
+        for cte in outer.with_ctes:
+            if cte.columns:
+                # Explicit column list: WITH cte(a, b, c) AS (...)
+                extra_schemas[cte.name] = list(cte.columns)
+            else:
+                # Infer from the CTE's SELECT
+                inferred = _infer_output_columns(cte.select, augmented)
+                extra_schemas[cte.name] = inferred
+
+    # 2. Process subqueries in FROM
+    if outer.from_clause:
+        for item in outer.from_clause:
+            if isinstance(item, a.SubqueryRef) and item.alias:
+                inferred = _infer_output_columns(item.select, augmented)
+                extra_schemas[item.alias] = inferred
+
+    return augmented
+
+
+# ---------------------------------------------------------------------------
 # Main analysis entry point
 # ---------------------------------------------------------------------------
 
@@ -332,16 +455,19 @@ def analyze_query(
         # For compound queries, analyse the first SELECT for column info
         outer = node.body[0].select
 
+    # Build augmented column lookup that knows CTE + subquery schemas
+    aug_columns = _build_augmented_columns_for_table(node, columns_for_table)
+
     # 1. Tables
     raw_tables = _collect_tables_from_select(node)
     info.tables = list(dict.fromkeys(raw_tables))  # dedupe, preserve order
 
     # 2. Alias map (from outermost FROM)
-    alias_map = _build_alias_map(outer.from_clause)
+    alias_map = _build_alias_map(outer.from_clause, aug_columns)
 
     # 3. Select columns (resolve stars, qualified refs, bare names)
     for col in outer.columns:
-        resolved = _resolve_column_ref(col.expr, alias_map, columns_for_table)
+        resolved = _resolve_column_ref(col.expr, alias_map, aug_columns)
         if resolved:
             info.select_columns.extend(resolved)
         else:
@@ -355,7 +481,7 @@ def analyze_query(
     order_by = node.order_by if hasattr(node, "order_by") else None
     if order_by:
         for item in order_by:
-            resolved = _resolve_column_ref(item.expr, alias_map, columns_for_table)
+            resolved = _resolve_column_ref(item.expr, alias_map, aug_columns)
             if resolved:
                 direction = item.direction
                 for r in resolved:
@@ -383,6 +509,20 @@ def analyze_query(
 
     # 6. Extras
     info.extras["has_where"] = outer.where is not None
+    # Expose inferred CTE/subquery schemas if any were discovered
+    if outer.with_ctes:
+        cte_schemas = {}
+        for cte in outer.with_ctes:
+            cte_schemas[cte.name] = aug_columns(cte.name)
+        if cte_schemas:
+            info.extras["cte_schemas"] = cte_schemas
+    if outer.from_clause:
+        subquery_schemas = {}
+        for item in outer.from_clause:
+            if isinstance(item, a.SubqueryRef) and item.alias:
+                subquery_schemas[item.alias] = aug_columns(item.alias)
+        if subquery_schemas:
+            info.extras["subquery_schemas"] = subquery_schemas
     info.extras["has_group_by"] = outer.group_by is not None
     info.extras["has_having"] = outer.having is not None
     info.extras["has_limit"] = outer._has_limit
@@ -796,6 +936,154 @@ def main():
         """,
     ))
 
+    # --- Test 25: CTE bare column resolution ---
+    tests.append((
+        "25. CTE columns resolved (bare refs from CTE disambiguated)",
+        """
+        WITH user_totals AS (
+            SELECT u.id AS user_id, u.name, SUM(o.total) AS total_spent
+            FROM users u
+            JOIN orders o ON u.id = o.user_id
+            GROUP BY u.id, u.name
+        )
+        SELECT user_id, name, total_spent
+        FROM user_totals
+        WHERE total_spent > 1000
+        ORDER BY total_spent DESC
+        """,
+    ))
+
+    # --- Test 26: CTE with SELECT * from CTE ---
+    tests.append((
+        "26. SELECT * from a CTE",
+        """
+        WITH recent_orders AS (
+            SELECT o.id, o.user_id, o.total, o.created_at
+            FROM orders o
+            WHERE o.created_at > '2024-01-01'
+        )
+        SELECT *
+        FROM recent_orders
+        ORDER BY created_at DESC
+        """,
+    ))
+
+    # --- Test 27: Subquery in FROM with column resolution ---
+    tests.append((
+        "27. Subquery-in-FROM columns resolved",
+        """
+        SELECT sub.user_name, sub.order_count
+        FROM (
+            SELECT u.name AS user_name, COUNT(*) AS order_count
+            FROM users u
+            JOIN orders o ON u.id = o.user_id
+            GROUP BY u.name
+        ) sub
+        ORDER BY sub.order_count DESC
+        """,
+    ))
+
+    # --- Test 28: Subquery in FROM with SELECT * ---
+    tests.append((
+        "28. SELECT * from subquery-in-FROM",
+        """
+        SELECT *
+        FROM (
+            SELECT u.name, u.email, COUNT(*) AS cnt
+            FROM users u
+            JOIN orders o ON u.id = o.user_id
+            GROUP BY u.name, u.email
+        ) stats
+        ORDER BY cnt DESC
+        """,
+    ))
+
+    # --- Test 29: Chained CTEs (CTE2 references CTE1) ---
+    tests.append((
+        "29. Chained CTEs (CTE2 reads from CTE1)",
+        """
+        WITH order_totals AS (
+            SELECT user_id, SUM(total) AS total_spent
+            FROM orders
+            GROUP BY user_id
+        ),
+        top_spenders AS (
+            SELECT user_id, total_spent
+            FROM order_totals
+            WHERE total_spent > 5000
+        )
+        SELECT u.name, ts.total_spent
+        FROM users u
+        JOIN top_spenders ts ON u.id = ts.user_id
+        ORDER BY ts.total_spent DESC
+        """,
+    ))
+
+    # --- Test 30: CTE with explicit column list ---
+    tests.append((
+        "30. CTE with explicit column list",
+        """
+        WITH summary(uid, spend) AS (
+            SELECT user_id, SUM(total)
+            FROM orders
+            GROUP BY user_id
+        )
+        SELECT u.name, s.spend
+        FROM users u
+        JOIN summary s ON u.id = s.uid
+        ORDER BY s.spend DESC
+        """,
+    ))
+
+    # --- Test 31: CTE with SELECT * expansion inside the CTE ---
+    tests.append((
+        "31. CTE that uses SELECT * from a real table",
+        """
+        WITH all_users AS (
+            SELECT * FROM users
+        )
+        SELECT name, email
+        FROM all_users
+        ORDER BY name
+        """,
+    ))
+
+    # --- Test 32: Subquery-in-FROM joined with real table ---
+    tests.append((
+        "32. Subquery-in-FROM joined with real table",
+        """
+        SELECT u.name, sub.total_orders, sub.total_spent
+        FROM users u
+        JOIN (
+            SELECT user_id, COUNT(*) AS total_orders, SUM(total) AS total_spent
+            FROM orders
+            GROUP BY user_id
+        ) sub ON u.id = sub.user_id
+        ORDER BY sub.total_spent DESC
+        """,
+    ))
+
+    # --- Test 33: CTE + subquery-in-FROM combined ---
+    tests.append((
+        "33. CTE + subquery-in-FROM combined",
+        """
+        WITH active AS (
+            SELECT DISTINCT user_id
+            FROM orders
+            WHERE created_at > '2024-01-01'
+        )
+        SELECT u.name, stats.order_count
+        FROM users u
+        JOIN (
+            SELECT a.user_id, COUNT(*) AS order_count
+            FROM active a
+            JOIN orders o ON a.user_id = o.user_id
+            GROUP BY a.user_id
+        ) stats ON u.id = stats.user_id
+        ORDER BY stats.order_count DESC
+        """,
+    ))
+
     # ------------------------------------------------------------------
     # Run tests
     # ------------------------------------------------------------------
@@ -850,7 +1138,37 @@ WHAT WORKS RELIABLY
    - Expression columns (functions, CASE, etc.) → reported by alias if present,
      or by a short expression summary. Good enough for metadata.
 
-3. ORDER BY COLUMNS (high confidence for simple cases)
+3. CTE + SUBQUERY-IN-FROM COLUMN INFERENCE (high confidence)
+   CTE and subquery-in-FROM output columns are inferred by analyzing their
+   SELECT lists. This enables:
+   - Bare column refs from CTEs resolved (Test 25):
+     `SELECT user_id FROM user_totals` → "user_totals.user_id"
+   - SELECT * from CTEs expanded (Test 26):
+     `SELECT * FROM recent_orders` → all inferred CTE columns
+   - Subquery-in-FROM with SELECT * (Test 28):
+     `SELECT * FROM (...) stats` → "stats.name", "stats.email", "stats.cnt"
+   - Chained CTEs (Test 29): CTE2 referencing CTE1 works because CTEs are
+     processed in order, each augmenting the lookup for later ones.
+   - Explicit CTE column lists (Test 30):
+     `WITH summary(uid, spend) AS (...)` → uses the explicit names.
+   - CTE using SELECT * from a real table (Test 31):
+     `WITH all_users AS (SELECT * FROM users)` → inherits users' columns.
+   - Combined CTE + subquery-in-FROM (Test 33) works.
+
+   Implementation: _infer_output_columns() walks a Select's ResultColumn
+   list applying these rules:
+     - alias present → use alias
+     - Name("col") → use "col"
+     - Dot(Name("t"), Name("col")) → use "col"
+     - Star() → expand all FROM tables
+     - Dot(Name("t"), Star()) → expand that table
+     - expression without alias → use expression summary
+
+   _build_augmented_columns_for_table() wraps the base callback, processing
+   CTEs in declaration order and subqueries-in-FROM so each augments the
+   lookup before subsequent ones are resolved.
+
+4. ORDER BY COLUMNS (high confidence for simple cases)
    - Qualified refs (o.total) → resolved via alias map. Works.
    - Bare column names → resolved when unambiguous. Works.
    - Positional ORDER BY (ORDER BY 2) → mapped to the Nth select column. Works.
@@ -859,7 +1177,7 @@ WHAT WORKS RELIABLY
    - Expression ORDER BY (ORDER BY o.total * o.quantity) → reported as
      "<expr: ...>" with a summary. Correctly identified as non-simple.
 
-4. FUNCTION EXTRACTION (high confidence)
+5. FUNCTION EXTRACTION (high confidence)
    - All FunctionCall nodes in the SELECT are collected, including nested ones.
    - UPPER(SUBSTR(...)) correctly reports both UPPER and SUBSTR.
    - Window functions (ROW_NUMBER, SUM OVER) are correctly identified.
@@ -868,10 +1186,11 @@ WHAT WORKS RELIABLY
      So `name LIKE '%x%'` shows up as a LIKE function. This is a feature of
      the parser matching SQLite's own behavior, not a bug.
 
-5. HIGH-LEVEL EXTRAS (reliable)
+6. HIGH-LEVEL EXTRAS (reliable)
    - has_where, has_group_by, has_having, has_limit, has_order_by, is_distinct
    - is_compound + compound_operators (UNION, UNION ALL, etc.)
-   - cte_names
+   - cte_names + cte_schemas (inferred column lists per CTE)
+   - subquery_schemas (inferred column lists per subquery-in-FROM)
    - joins with type (JOIN, LEFT JOIN, etc.) and table name
    - where_references_tables (tables found in WHERE subqueries)
 
@@ -886,31 +1205,19 @@ KNOWN LIMITATIONS / EDGE CASES
    (e.g., "c.name" vs "p.name" or "categories[c].name" vs "categories[p].name").
    This is inherent to resolving aliases to real table names.
 
-2. CTE COLUMNS NOT KNOWN TO columns_for_table
-   When a CTE is used (e.g., big_spenders, user_stats), the alias map
-   resolves bs→big_spenders, but columns_for_table doesn't know the schema
-   of the CTE. So bs.total_spent resolves to "big_spenders.total_spent"
-   using the alias map (which is correct), but bare column refs from CTEs
-   can't be disambiguated. To fix this, you'd need to analyze the CTE's
-   SELECT list to infer its output columns.
-
-3. SUBQUERY-IN-FROM COLUMNS
-   Similar to CTEs: subqueries in FROM (Test 19) produce a SubqueryRef with
-   an alias, but the alias map doesn't include it (it's not a TableRef).
-   sub.user_name resolves to "sub.user_name" using the fallback. To fix,
-   you'd need to infer the subquery's output columns from its SELECT list.
-
-4. COMPOUND QUERIES (UNION)
+2. COMPOUND QUERIES (UNION)
    For UNION/INTERSECT/EXCEPT, we analyze only the first SELECT for columns.
    The column names come from the first branch, which is SQL-standard behavior.
    Tables are collected from ALL branches, which is correct.
 
-5. SCOPE OF columns_for_table
-   The callback only knows about "real" database tables. CTEs, subquery
-   aliases, and virtual constructs need separate handling. This is
-   fundamental: the library parses syntax, not semantics.
+3. EXPRESSION COLUMNS WITHOUT ALIASES
+   When a CTE or subquery SELECT list contains an expression without an alias
+   (e.g., `SELECT 1+2, COUNT(*)`), we use _expr_summary() as the column
+   name. SQLite internally uses the expression text, which is close but not
+   guaranteed identical. In practice, such columns almost always have aliases
+   in real-world queries.
 
-6. EXPRESSION COLUMNS IN ORDER BY
+4. EXPRESSION COLUMNS IN ORDER BY
    ORDER BY with expressions (e.g., o.total * o.quantity) are correctly
    flagged as non-simple. No attempt to decompose the expression into
    constituent column refs, which would be possible but requires more work.
@@ -921,16 +1228,18 @@ sqlite-ast provides a reliable, complete AST that makes all of the above
 extractions straightforward. The AST structure maps directly to the query
 structure, with clean dataclass nodes that are easy to walk recursively.
 
+CTE and subquery-in-FROM column inference closes the main semantic gap
+identified in the first round of experiments. The augmented lookup approach
+(process CTEs in order, each augmenting the callback for the next) handles
+chained dependencies, explicit column lists, and star expansion through
+virtual tables cleanly.
+
 The library is well-suited for:
 - Extracting table dependencies from queries
 - Understanding query structure (joins, subqueries, CTEs, etc.)
 - Identifying functions used
 - Resolving column references when schema info is available
 - Building query analysis/linting/documentation tools
-
-The main gap is semantic analysis (resolving CTE/subquery output columns,
-handling self-joins with distinct aliases), which is expected since this is
-a parser, not a query planner.
 """)
 
 
