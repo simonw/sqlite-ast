@@ -125,6 +125,23 @@ class TestTablesReferenced:
         node = parse_ast("SELECT 1 + 2 AS result")
         assert node.tables_referenced() == []
 
+    def test_deduplication(self):
+        node = parse_ast("""
+            SELECT u.name, o.total
+            FROM users u
+            JOIN orders o ON u.id = o.user_id
+            WHERE o.total > (SELECT AVG(total) FROM orders)
+        """)
+        assert node.tables_referenced() == ["users", "orders"]
+
+    def test_compound_deduplication(self):
+        node = parse_ast("""
+            SELECT name FROM users
+            UNION ALL
+            SELECT name FROM users
+        """)
+        assert node.tables_referenced() == ["users"]
+
 
 # ---------------------------------------------------------------------------
 # functions_used()
