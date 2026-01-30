@@ -143,7 +143,7 @@ class Parser:
         return result
 
     def _parse_select_or_compound(self) -> ast.Select | ast.Compound:
-        first = self._parse_simple_select()
+        first = self._parse_simple_select(in_compound=False)
 
         # Check for compound operators
         if not self.at(
@@ -158,7 +158,7 @@ class Parser:
             operator = op_tok.value.upper()
             if operator == "UNION" and self.match(TokenType.ALL):
                 operator = "UNION ALL"
-            next_select = self._parse_simple_select()
+            next_select = self._parse_simple_select(in_compound=True)
             next_select._compound_member = True
             parts.append(ast.CompoundPart(select=next_select, operator=operator))
 
@@ -179,7 +179,7 @@ class Parser:
 
     # --- Simple SELECT ---
 
-    def _parse_simple_select(self) -> ast.Select:
+    def _parse_simple_select(self, in_compound: bool = False) -> ast.Select:
         self.expect(TokenType.SELECT)
         sel = ast.Select()
 
@@ -214,17 +214,20 @@ class Parser:
         if self.match(TokenType.WINDOW):
             sel.window_definitions = self._parse_window_definitions()
 
-        # ORDER BY (only for non-compound selects — compound handles its own)
-        if self.match(TokenType.ORDER):
-            self.expect(TokenType.BY)
-            sel.order_by = self._parse_order_by_list()
+        # ORDER BY and LIMIT are only parsed for standalone selects,
+        # not for compound members (compound handles its own ORDER BY/LIMIT)
+        if not in_compound:
+            if self.peek().value.upper() == "ORDER":
+                self.advance()
+                self.expect(TokenType.BY)
+                sel.order_by = self._parse_order_by_list()
 
-        # LIMIT
-        if self.match(TokenType.LIMIT):
-            sel._has_limit = True
-            sel.limit = self._parse_expr()
-            if self.match(TokenType.OFFSET):
-                sel.offset = self._parse_expr()
+            if self.peek().value.upper() == "LIMIT":
+                self.advance()
+                sel._has_limit = True
+                sel.limit = self._parse_expr()
+                if self.match(TokenType.OFFSET):
+                    sel.offset = self._parse_expr()
 
         return sel
 
@@ -682,6 +685,13 @@ class Parser:
         # Frame spec
         if self.at(TokenType.RANGE, TokenType.ROWS, TokenType.GROUPS):
             spec.frame = self._parse_frame_spec()
+        else:
+            # Default frame for any inline window spec
+            spec.frame = ast.FrameSpec(
+                type="RANGE",
+                start=ast.FrameBound(type="UNBOUNDED"),
+                end=ast.FrameBound(type="CURRENT ROW"),
+            )
 
         self.expect(TokenType.RPAREN)
         return spec
@@ -1095,6 +1105,13 @@ class Parser:
         # Frame spec
         if self.at(TokenType.RANGE, TokenType.ROWS, TokenType.GROUPS):
             wdef.frame = self._parse_frame_spec()
+        elif wdef.order_by is not None or wdef.partition_by is not None:
+            # Default frame when ORDER BY or PARTITION BY present
+            wdef.frame = ast.FrameSpec(
+                type="RANGE",
+                start=ast.FrameBound(type="UNBOUNDED"),
+                end=ast.FrameBound(type="CURRENT ROW"),
+            )
 
         self.expect(TokenType.RPAREN)
         return wdef

@@ -16,7 +16,6 @@ def load_conformance_tests():
 
 
 @pytest.mark.parametrize("sql,expected_ast", load_conformance_tests())
-@pytest.mark.xfail(reason="Not yet implemented", strict=False)
 def test_conformance(sql, expected_ast):
     result = parse(sql)
     assert result == expected_ast
