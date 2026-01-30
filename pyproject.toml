@@ -1,15 +1,12 @@
 [project]
 name = "sqlite-ast"
-version = "0.1"
+version = "0.1a0"
 description = "Python library for parsing SQLite SELECT queries into an AST"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "Simon Willison"}]
 license = "Apache-2.0"
 classifiers = []
-dependencies = [
-
-]
 
 [dependency-groups]
 dev = [
