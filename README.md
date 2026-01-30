@@ -13,6 +13,10 @@ Install this library using `pip`:
 ```bash
 pip install sqlite-ast
 ```
+## Demo
+
+You can try this library out in your browser (via Pyodide) at [tools.simonwillison.net/sqlite-ast](https://tools.simonwillison.net/sqlite-ast).
+
 ## Usage
 
 The main entry point is `parse(sql)`, which returns a nested Python dictionary:
